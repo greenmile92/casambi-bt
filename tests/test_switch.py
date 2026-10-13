@@ -349,6 +349,16 @@ _EXPECTED_BAD = {
         P, H, RAH,  # hold 3.9 s
     ],
 }
+
+_EXPECTED_TWO_BUTTONS = {
+    (47, 2): [P, R],  # pressed together with button 4: one telegram, shared origin
+    (47, 4): [
+        P, R,  # together with button 2
+        P, R,  # single click
+        # single click, down frame lost: up + 0x02 stay silent
+    ],
+    (9, 2): [P, R],  # single click, release only on 0x12
+}
 # fmt: on
 
 
@@ -372,6 +382,7 @@ def _replay(name: str) -> dict[tuple[int, int], list[ButtonEventType]]:
 _CAPTURES = [
     ("ptm215b_2026-10-13.txt", _EXPECTED),
     ("ptm215b_bad_2026-10-13.txt", _EXPECTED_BAD),
+    ("ptm215b_zwei_tasten_2026-10-13.txt", _EXPECTED_TWO_BUTTONS),
 ]
 
 
