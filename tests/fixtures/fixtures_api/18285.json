@@ -1,0 +1,62 @@
+{
+ "id": 18285,
+ "type": 1,
+ "time": 1629259238836,
+ "firmware": 6680,
+ "extendedFirmware": 12800,
+ "evoFirmware": 12800,
+ "board": 51970,
+ "vendor": "LEDbyDESIGN",
+ "vendorID": 0,
+ "model": "TunableWhite",
+ "mode": "PWM/2ch/Dim,TW",
+ "hasPushButton": false,
+ "hasRotarySwitch": false,
+ "hasSmartSwitch": false,
+ "hasModes": true,
+ "hasStartupState": true,
+ "hasPresenceSensor": false,
+ "hasLightSensor": false,
+ "hasGenericSensor": false,
+ "hasDaylightControl": false,
+ "owner": 0,
+ "readOnlyLength": 0,
+ "stateLength": 2,
+ "stateMode": 2,
+ "module": 3706,
+ "pushButtonCount": 0,
+ "profiles": [
+  18217,
+  18283,
+  18140,
+  18284,
+  37068,
+  18222
+ ],
+ "controls": [
+  {
+   "type": "dimmer",
+   "offset": 0,
+   "length": 8,
+   "default": 255,
+   "readonly": false
+  },
+  {
+   "type": "temperature",
+   "offset": 8,
+   "length": 8,
+   "min": 2700,
+   "max": 6500,
+   "default": 127,
+   "readonly": false
+  }
+ ],
+ "parameters": [],
+ "pushButtons": [],
+ "strings": {},
+ "hasTW": true,
+ "cctMinKelvin": 2700,
+ "cctMaxKelvin": 6500,
+ "daliAddressing": "Device",
+ "extifNetworkControlEnabled": false
+}

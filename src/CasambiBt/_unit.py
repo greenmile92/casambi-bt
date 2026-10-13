@@ -95,6 +95,8 @@ class UnitControl:
 
     min: int | None = None
     max: int | None = None
+    name: str | None = None
+    """Channel name from the fixture, e.g. ``CH1`` or ``Red`` for slider controls."""
 
 
 @dataclass(frozen=True, repr=True)
@@ -153,6 +155,7 @@ class UnitState:
         self._colorsource: ColorSource | None = None
         self._xy: tuple[float, float] | None = None
         self._slider: int | None = None
+        self._sliders: dict[int, int] = {}
         self._onoff: bool | None = None
         self._white_balance: int | None = None
         self._presence: int | None = None
@@ -341,6 +344,15 @@ class UnitState:
     @slider.deleter
     def slider(self) -> None:
         self._slider = None
+
+    @property
+    def sliders(self) -> dict[int, int]:
+        """Return the value of every slider control keyed by its bit offset.
+
+        Units with several slider channels (e.g. 4CH, Sliders/RGBW) have one entry
+        per channel. :attr:`slider` only holds the last one.
+        """
+        return dict(self._sliders)
 
     @property
     def onoff(self) -> bool | None:
@@ -620,6 +632,9 @@ class Unit:
                 scaledValue = state.colorsource.value
             elif c.type == UnitControlType.XY and state.xy is not None:
                 scaledValue = UnitState.int_from_xy(state.xy, c.length)
+            elif c.type == UnitControlType.SLIDER and c.offset in state._sliders:
+                scale = UnitState.SLIDER_RESOLUTION - c.length
+                scaledValue = state._sliders[c.offset] >> scale
             elif c.type == UnitControlType.SLIDER and state.slider is not None:
                 scale = UnitState.SLIDER_RESOLUTION - c.length
                 scaledValue = state.slider >> scale
@@ -727,6 +742,7 @@ class Unit:
             elif c.type == UnitControlType.SLIDER:
                 scale = UnitState.SLIDER_RESOLUTION - c.length
                 self._state.slider = cInt << scale
+                self._state._sliders[c.offset] = cInt << scale
             elif c.type == UnitControlType.ONOFF:
                 self._state.onoff = cInt != 0
             elif c.type == UnitControlType.WHITECOLORBALANCE:

@@ -1,7 +1,7 @@
 import json
 import logging
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Final, cast
 
@@ -20,7 +20,64 @@ from .errors import (
 )
 
 SESSION_CACHE_FILE: Final = "session.pck"
-TYPES_CACHE_FILE: Final = "types.pck"
+# v2: UnitControl carries the channel name. Older caches lack it, so refetch once.
+TYPES_CACHE_FILE: Final = "types-v2.pck"
+
+
+def _parseUnitType(unitTypeJson: dict, logger: logging.Logger) -> UnitType:
+    """Parse a fixture from ``https://api.casambi.com/fixture/<id>``."""
+    controls = []
+    for controlJson in unitTypeJson["controls"]:
+        typeStr = controlJson["type"].upper()
+        try:
+            type = UnitControlType[typeStr]
+        except KeyError:
+            logger.warning(
+                f"Unsupported control mode {typeStr} in fixture {unitTypeJson['id']}."
+            )
+            type = UnitControlType.UNIMPLEMENTED
+
+        controls.append(
+            UnitControl(
+                type,
+                controlJson["offset"],
+                controlJson["length"],
+                controlJson["default"],
+                controlJson["readonly"],
+                controlJson.get("min", None),
+                controlJson.get("max", None),
+                controlJson.get("name", None),
+            )
+        )
+
+    return UnitType(
+        unitTypeJson["id"],
+        unitTypeJson["model"],
+        unitTypeJson["vendor"],
+        unitTypeJson["mode"],
+        unitTypeJson["stateLength"],
+        controls,
+    )
+
+
+def _withUnitCctRange(unitType: UnitType, settings: dict) -> UnitType:
+    """Return the unit type with the temperature range configured for this unit.
+
+    The fixture holds a generic range (e.g. 2700-6500 K), the app lets the user set
+    the real range of the connected LEDs per unit (``cct.minKelvins``/``cct.maxKelvins``).
+    """
+    lo, hi = settings.get("cct.minKelvins"), settings.get("cct.maxKelvins")
+    if lo is None or hi is None or not lo < hi:
+        return unitType
+    controls = [
+        replace(c, min=int(lo), max=int(hi))
+        if c.type == UnitControlType.TEMPERATURE
+        else c
+        for c in unitType.controls
+    ]
+    if controls == unitType.controls:
+        return unitType
+    return replace(unitType, controls=controls)
 
 
 @dataclass()
@@ -273,6 +330,7 @@ class Network:
                     "Failed to fetch type for unit %i. Skipping.", u["type"]
                 )
                 continue
+            uType = _withUnitCctRange(uType, u.get("settings", {}))
             uObj = Unit(
                 u["type"],
                 u["deviceID"],
@@ -353,41 +411,7 @@ class Network:
             )
             return None
 
-        unitTypeJson = res.json()
-
-        # Parse UnitControls
-        controls = []
-        for controlJson in unitTypeJson["controls"]:
-            typeStr = controlJson["type"].upper()
-            try:
-                type = UnitControlType[typeStr]
-            except KeyError:
-                self._logger.warning(
-                    f"Unsupported control mode {typeStr} in fixture {id}."
-                )
-                type = UnitControlType.UNIMPLEMENTED
-
-            controlObj = UnitControl(
-                type,
-                controlJson["offset"],
-                controlJson["length"],
-                controlJson["default"],
-                controlJson["readonly"],
-                controlJson.get("min", None),
-                controlJson.get("max", None),
-            )
-
-            controls.append(controlObj)
-
-        # Parse UnitType
-        unitTypeObj = UnitType(
-            unitTypeJson["id"],
-            unitTypeJson["model"],
-            unitTypeJson["vendor"],
-            unitTypeJson["mode"],
-            unitTypeJson["stateLength"],
-            controls,
-        )
+        unitTypeObj = _parseUnitType(res.json(), self._logger)
 
         # Chache unit type
         self._unitTypes[unitTypeObj.id] = (

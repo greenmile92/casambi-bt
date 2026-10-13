@@ -1,0 +1,61 @@
+{
+ "id": 5511,
+ "type": 4,
+ "time": 1655385732507,
+ "firmware": 6680,
+ "extendedFirmware": 12800,
+ "evoFirmware": 12800,
+ "board": 51970,
+ "vendor": "Danlers Limited",
+ "vendorID": 0,
+ "model": "CBU-CEFL",
+ "mode": "Sensor{Presence,Daylight}",
+ "hasPushButton": false,
+ "hasRotarySwitch": false,
+ "hasSmartSwitch": false,
+ "hasModes": false,
+ "hasStartupState": false,
+ "hasPresenceSensor": true,
+ "hasLightSensor": true,
+ "hasGenericSensor": false,
+ "hasDaylightControl": false,
+ "owner": 0,
+ "readOnlyLength": 14,
+ "stateLength": 2,
+ "stateMode": 20,
+ "module": 830,
+ "pushButtonCount": 0,
+ "controls": [
+  {
+   "type": "presence",
+   "dataname": "presence",
+   "offset": 0,
+   "length": 2,
+   "default": 0,
+   "readonly": true
+  },
+  {
+   "type": "lux",
+   "dataname": "lux",
+   "offset": 2,
+   "length": 12,
+   "max": 2000,
+   "default": 0,
+   "readonly": true
+  },
+  {
+   "type": "placeholder",
+   "offset": 14,
+   "length": 1,
+   "default": 0,
+   "readonly": false
+  }
+ ],
+ "parameters": [],
+ "pushButtons": [],
+ "strings": {},
+ "maxLux": 2000,
+ "hasTW": false,
+ "daliAddressing": "Device",
+ "extifNetworkControlEnabled": false
+}
