@@ -81,6 +81,25 @@ def _withUnitCctRange(unitType: UnitType, settings: dict) -> UnitType:
     return replace(unitType, controls=controls)
 
 
+def _withoutDisabledSensors(unitType: UnitType, settings: dict) -> UnitType:
+    """Drop presence/lux controls the user disabled for this unit in the app.
+
+    A disabled sensor still sends its bits (as 0), so mapping it would show a
+    reading that was never measured. Settings look like ``{"lux.disabled": 1.0}``.
+    """
+    controls = [
+        c
+        for c in unitType.controls
+        if not (
+            c.type in (UnitControlType.PRESENCE, UnitControlType.LUX)
+            and settings.get(f"{c.type.name.lower()}.disabled")
+        )
+    ]
+    if len(controls) == len(unitType.controls):
+        return unitType
+    return replace(unitType, controls=controls)
+
+
 @dataclass()
 class _NetworkSession:
     session: str
@@ -342,6 +361,7 @@ class Network:
                 )
                 continue
             uType = _withUnitCctRange(uType, u.get("settings", {}))
+            uType = _withoutDisabledSensors(uType, u.get("settings", {}))
             uObj = Unit(
                 u["type"],
                 u["deviceID"],

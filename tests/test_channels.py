@@ -9,7 +9,11 @@ import json
 import logging
 import pathlib
 
-from CasambiBt._network import _parseUnitType, _withUnitCctRange
+from CasambiBt._network import (
+    _parseUnitType,
+    _withoutDisabledSensors,
+    _withUnitCctRange,
+)
 from CasambiBt._unit import Unit, UnitControlType
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "fixtures_api"
@@ -21,6 +25,7 @@ def make_unit(fixture_id: int, settings: dict | None = None) -> Unit:
         logging.getLogger(__name__),
     )
     unit_type = _withUnitCctRange(unit_type, settings or {})
+    unit_type = _withoutDisabledSensors(unit_type, settings or {})
     return Unit(fixture_id, 1, "uuid", "addr", "name", "1", unit_type)
 
 
@@ -110,3 +115,17 @@ def test_presence_and_lux():
     unit.setStateFromBytes(pack((0, 2, 0), (2, 12, 7), length=2))
     assert unit.state.presence == 0
     assert unit.state.lux == 7
+
+
+def test_sensor_disabled_in_app_is_not_mapped():
+    """BM Flur 1-3 have lux.disabled: their lux bits are 0, not a measurement."""
+    unit = make_unit(5511, {"lux.disabled": 1.0, "presence.disabled": 0.0})
+    assert unit.unitType.get_control(UnitControlType.LUX) is None
+    assert unit.unitType.get_control(UnitControlType.PRESENCE) is not None
+
+    unit.setStateFromBytes(pack((0, 2, 1), (2, 12, 0), length=2))
+    assert unit.state.presence == 1
+    assert unit.state.lux is None
+
+    enabled = make_unit(5511, {"lux.disabled": 0.0})
+    assert enabled.unitType.get_control(UnitControlType.LUX) is not None
