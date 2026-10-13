@@ -1,15 +1,22 @@
-"""Tests for SwitchEventDecoder — origin-based retransmit deduplication."""
+"""Tests for SwitchEventDecoder — contact state, phase logic, retransmit dedup."""
 
 import struct
-from time import monotonic
+from pathlib import Path
 
+import pytest
+
+import CasambiBt._switch as switch_module
 from CasambiBt._switch import (
-    _DEDUP_WINDOW_SECONDS,
     _TARGET_TYPE_BUTTON,
     _TARGET_TYPE_INPUT,
     ButtonEventType,
     SwitchEventDecoder,
 )
+
+P = ButtonEventType.PRESS
+R = ButtonEventType.RELEASE
+H = ButtonEventType.HOLD
+RAH = ButtonEventType.RELEASE_AFTER_HOLD
 
 # ---------------------------------------------------------------------------
 # Helpers to build raw INVOCATION frames
@@ -19,226 +26,314 @@ from CasambiBt._switch import (
 #   opcode:u8
 #   origin:u16 (big-endian)
 #   target:u16 (big-endian) — low byte = target_type, high byte = unit_id
-#   age:u16 (big-endian)
+#   age:u16 (big-endian)    — 10 ms ticks since the frame was originated
 #   payload: payload_len bytes
 
 _OPCODE_BUTTON_0 = 29  # FunctionButtonEvent0 → button 1
 _OPCODE_INPUT_0 = 64  # FunctionNotifyInput0 → button 1
 _UNIT_ID = 0x15
-_AGE = 0x0001
+_DOWN = b"\xf9\x00\x00\x00"  # PTM215B 0x06 payload while pressed
+_UP = b"\x79\x00\x00\x00"  # PTM215B 0x06 payload after release
 
 
-def _button_frame(origin: int, payload: bytes = b"\xf9") -> bytes:
-    """Build a 0x06 button-stream INVOCATION frame.
-
-    Pass the raw origin value directly.  The decoder derives PRESS/RELEASE from
-    bit 1: origin & 0x02 == 0 → PRESS, != 0 → RELEASE.
-
-    Typical PTM215B pattern:
-      - PRESS:   origin = 0xXXX0  (bit 1 clear)
-      - RELEASE: origin = 0xXXX2  (bit 1 set, same counter bits)
-      - Next physical event: counter bits incremented (e.g. 0xXXX4 / 0xXXX6)
-    """
-    payload_len = len(payload)
-    flags = payload_len & 0x3F
+def _button_frame(origin: int, payload: bytes = _DOWN, age: int = 1) -> bytes:
+    """Build a 0x06 button-stream INVOCATION frame."""
     target = (_UNIT_ID << 8) | _TARGET_TYPE_BUTTON
     return (
-        struct.pack(">HBHHH", flags, _OPCODE_BUTTON_0, origin, target, _AGE) + payload
+        struct.pack(">HBHHH", len(payload), _OPCODE_BUTTON_0, origin, target, age)
+        + payload
     )
 
 
-def _input_frame(origin: int, event_code: int, payload_extra: bytes = b"") -> bytes:
-    """Build a 0x12 input-stream INVOCATION frame."""
-    payload = bytes([event_code]) + payload_extra
-    payload_len = len(payload)
-    flags = payload_len & 0x3F
+def _input_frame(origin: int, event_code: int, age: int = 1) -> bytes:
+    """Build a 0x12 input-stream INVOCATION frame (payload = code, 0x08)."""
+    payload = bytes([event_code, 0x08])
     target = (_UNIT_ID << 8) | _TARGET_TYPE_INPUT
-    return struct.pack(">HBHHH", flags, _OPCODE_INPUT_0, origin, target, _AGE) + payload
+    return (
+        struct.pack(">HBHHH", len(payload), _OPCODE_INPUT_0, origin, target, age)
+        + payload
+    )
+
+
+class _Clock:
+    """Replaces monotonic() in the decoder module."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    c = _Clock()
+    monkeypatch.setattr(switch_module, "monotonic", c)
+    return c
+
+
+def _events(dec: SwitchEventDecoder, *frames: bytes) -> list[ButtonEventType]:
+    return [e.event for f in frames for e in dec.decode(f, packet_seq=1)]
 
 
 # ---------------------------------------------------------------------------
-# 0x06 button stream tests
+# Contact state and phase logic
 # ---------------------------------------------------------------------------
 
 
-class TestButtonStreamDedup:
-    # PTM215B origin convention used in these tests:
-    #   0xXXX0 → PRESS  (bit 1 = 0)
-    #   0xXXX2 → RELEASE (bit 1 = 1, same counter bits)
-    #   0xXXX4 → next physical PRESS  (counter incremented, bit 1 = 0)
-
-    def test_sequential_retransmits_deduplicated(self):
-        """3 identical PRESS frames (same origin) → exactly 1 PRESS emitted."""
+class TestContactState:
+    def test_down_is_press_regardless_of_origin_bits(self, clock):
+        """0xF9 means pressed even when origin bit 1 is set (old decoder: RELEASE)."""
         dec = SwitchEventDecoder()
-        frame = _button_frame(origin=0x15B0)  # PRESS (bit 1 = 0)
+        assert _events(dec, _button_frame(0x06EF, _DOWN)) == [P]
 
-        results = []
-        for _ in range(3):
-            results.extend(dec.decode(frame, packet_seq=1))
-
-        assert len(results) == 1
-        assert results[0].event == ButtonEventType.PRESS
-
-    def test_press_then_release_both_emitted(self):
-        """PRESS (origin 0x15B0) then RELEASE (origin 0x15B2) → both emitted."""
+    def test_up_after_down_is_release(self, clock):
         dec = SwitchEventDecoder()
-        press_frame = _button_frame(origin=0x15B0)  # bit 1 = 0 → PRESS
-        release_frame = _button_frame(origin=0x15B2)  # bit 1 = 1 → RELEASE
+        assert _events(
+            dec, _button_frame(0x0610, _DOWN), _button_frame(0x0611, _UP)
+        ) == [P, R]
 
-        results = dec.decode(press_frame, packet_seq=1)
-        results += dec.decode(release_frame, packet_seq=2)
-
-        assert len(results) == 2
-        assert results[0].event == ButtonEventType.PRESS
-        assert results[1].event == ButtonEventType.RELEASE
-
-    def test_late_press_retransmit_after_release_suppressed(self):
-        """Core regression test: late PRESS retransmit (same origin) arriving
-        after RELEASE must be suppressed, not emitted as a phantom PRESS."""
+    def test_short_click_release_reported_once_from_both_streams(self, clock):
+        """0x06 up and 0x12 0x02 describe the same release: one RELEASE only."""
         dec = SwitchEventDecoder()
-        press_frame = _button_frame(origin=0x15B0)  # PRESS
-        release_frame = _button_frame(origin=0x15B2)  # RELEASE (different origin)
-        late_press_retransmit = _button_frame(origin=0x15B0)  # same origin as PRESS
+        got = _events(
+            dec,
+            _button_frame(0x0613, _DOWN),
+            _button_frame(0x0614, _UP),
+            _input_frame(0x015B, 0x02),
+        )
+        assert got == [P, R]
 
-        results = dec.decode(press_frame, packet_seq=1)  # PRESS accepted
-        results += dec.decode(release_frame, packet_seq=2)  # RELEASE accepted
-        results += dec.decode(late_press_retransmit, packet_seq=3)  # must be suppressed
-
-        assert len(results) == 2
-        assert results[0].event == ButtonEventType.PRESS
-        assert results[1].event == ButtonEventType.RELEASE
-
-    def test_genuine_second_press_accepted_with_new_origin(self):
-        """A new physical PRESS (different origin, counter incremented) is accepted
-        immediately even within the dedup window."""
+    def test_release_from_input_stream_when_up_frame_lost(self, clock):
         dec = SwitchEventDecoder()
-        first_press = _button_frame(origin=0x15B0)  # PRESS, counter N
-        release = _button_frame(origin=0x15B2)  # RELEASE, counter N
-        second_press = _button_frame(origin=0x15B4)  # PRESS, counter N+1 (new origin)
+        got = _events(dec, _button_frame(0x061B, _DOWN), _input_frame(0x0119, 0x02))
+        assert got == [P, R]
 
-        results = dec.decode(first_press, packet_seq=1)
-        results += dec.decode(release, packet_seq=2)
-        results += dec.decode(second_press, packet_seq=3)
-
-        assert len(results) == 3
-        assert results[0].event == ButtonEventType.PRESS
-        assert results[1].event == ButtonEventType.RELEASE
-        assert results[2].event == ButtonEventType.PRESS
-
-    def test_same_origin_accepted_after_window_expires(self):
-        """Edge case: after the dedup window expires, the same origin is accepted
-        again (guards against sequence counter wrap-around)."""
+    def test_long_press_gives_press_hold_release_after_hold(self, clock):
+        """0x06 up after HOLD is the end of the hold, not a short release."""
         dec = SwitchEventDecoder()
-        origin = 0x15B0
-        frame = _button_frame(origin=origin)
+        got = _events(
+            dec,
+            _button_frame(0x0619, _DOWN),
+            _input_frame(0x0161, 0x09),
+            _button_frame(0x061A, _UP),
+            _input_frame(0x0118, 0x0C),
+        )
+        assert got == [P, H, RAH]
 
-        # Inject a stale entry as if it was recorded before the window.
-        past = monotonic() - _DEDUP_WINDOW_SECONDS - 0.1
-        dec._seen_origins[(_UNIT_ID, 0, origin)] = past
-
-        results = dec.decode(frame, packet_seq=1)
-
-        assert len(results) == 1
-        assert results[0].event == ButtonEventType.PRESS
-
-    def test_different_origin_always_accepted_within_window(self):
-        """Even within the window, a different origin (genuine new event) is accepted."""
+    def test_release_after_hold_from_input_stream_when_up_frame_lost(self, clock):
         dec = SwitchEventDecoder()
-        first_press = _button_frame(origin=0xAAA0)  # PRESS
-        second_press = _button_frame(origin=0xAAA4)  # new PRESS, different counter
+        got = _events(
+            dec,
+            _button_frame(0x2F87, _DOWN),
+            _input_frame(0x01E2, 0x09),
+            _input_frame(0x01FC, 0x0C),
+        )
+        assert got == [P, H, RAH]
 
-        results = dec.decode(first_press, packet_seq=1)
-        results += dec.decode(second_press, packet_seq=2)
-
-        assert len(results) == 2
-
-    def test_button_label_is_one_based(self):
-        """button field must equal button_event_index + 1."""
+    def test_release_without_press_is_dropped(self, clock):
+        """Press frame lost: neither up nor 0x02 may produce an orphan RELEASE."""
         dec = SwitchEventDecoder()
-        frame = _button_frame(origin=0x1000)
-        events = dec.decode(frame, packet_seq=1)
-        assert events[0].button == events[0].button_event_index + 1
+        assert (
+            _events(dec, _button_frame(0x2F7A, _UP), _input_frame(0x0113, 0x02)) == []
+        )
 
-    def test_unit_id_and_target_type_extracted(self):
-        """unit_id and target_type are correctly parsed from the target field."""
+    def test_input_stream_press_code_ignored(self, clock):
         dec = SwitchEventDecoder()
-        frame = _button_frame(origin=0x1000)
-        events = dec.decode(frame, packet_seq=1)
-        assert events[0].unit_id == _UNIT_ID
-        assert events[0].target_type == _TARGET_TYPE_BUTTON
+        assert _events(dec, _input_frame(0x0001, 0x01)) == []
+
+    def test_unknown_input_code_reported(self, clock):
+        dec = SwitchEventDecoder()
+        assert _events(dec, _input_frame(0x0001, 0x05)) == [ButtonEventType.UNKNOWN]
+
+    def test_button_label_unit_and_target_type(self, clock):
+        dec = SwitchEventDecoder()
+        (event,) = dec.decode(_button_frame(0x1000), packet_seq=1)
+        assert event.button == event.button_event_index + 1 == 1
+        assert event.unit_id == _UNIT_ID
+        assert event.target_type == _TARGET_TYPE_BUTTON
 
 
 # ---------------------------------------------------------------------------
-# 0x12 input stream tests (HOLD / RELEASE_AFTER_HOLD)
+# Retransmit deduplication
 # ---------------------------------------------------------------------------
 
 
-class TestInputStreamDedup:
-    def test_hold_retransmits_deduplicated(self):
-        """3 identical HOLD frames → exactly 1 HOLD emitted."""
+class TestDedup:
+    def test_sequential_retransmits_deduplicated(self, clock):
         dec = SwitchEventDecoder()
-        frame = _input_frame(origin=0x15C0, event_code=0x09)  # HOLD
+        frame = _button_frame(0x15B0)
+        assert _events(dec, frame, frame, frame) == [P]
 
-        results = []
-        for _ in range(3):
-            results.extend(dec.decode(frame, packet_seq=1))
-
-        assert len(results) == 1
-        assert results[0].event == ButtonEventType.HOLD
-
-    def test_press_and_release_from_input_stream_ignored(self):
-        """0x12 PRESS and RELEASE are authoritative only from 0x06 → ignored here."""
+    def test_hold_retransmits_deduplicated(self, clock):
         dec = SwitchEventDecoder()
-        press_frame = _input_frame(origin=0x0001, event_code=0x01)  # PRESS code
-        release_frame = _input_frame(origin=0x0002, event_code=0x02)  # RELEASE code
+        _events(dec, _button_frame(0x15B0))
+        hold = _input_frame(0x15C0, 0x09)
+        assert _events(dec, hold, hold, hold) == [H]
 
-        results = dec.decode(press_frame, packet_seq=1)
-        results += dec.decode(release_frame, packet_seq=2)
-
-        assert results == []
-
-    def test_late_hold_retransmit_suppressed(self):
-        """HOLD retransmit arriving after RELEASE_AFTER_HOLD is accepted is suppressed."""
+    def test_late_press_retransmit_after_release_suppressed(self, clock):
         dec = SwitchEventDecoder()
-        hold_origin = 0x15C0
-        rah_origin = 0x15C1
+        press = _button_frame(0x15B0, _DOWN)
+        got = _events(dec, press, _button_frame(0x15B1, _UP), press)
+        assert got == [P, R]
 
-        hold_frame = _input_frame(origin=hold_origin, event_code=0x09)
-        rah_frame = _input_frame(origin=rah_origin, event_code=0x0C)
-        late_hold = _input_frame(origin=hold_origin, event_code=0x09)
+    def test_copy_arriving_after_two_seconds_suppressed(self, clock):
+        """Real case org=0x0146: copies with age 17 and 191 ticks, 1.755 s apart.
 
-        results = dec.decode(hold_frame, packet_seq=1)
-        results += dec.decode(rah_frame, packet_seq=2)
-        results += dec.decode(late_hold, packet_seq=3)
+        The old 500 ms arrival window emitted RELEASE_AFTER_HOLD twice here.
+        """
+        dec = SwitchEventDecoder()
+        _events(dec, _button_frame(0x0622, _DOWN))
+        clock.now += 0.75
+        _events(dec, _input_frame(0x0121, 0x09))
+        clock.now += 0.82
+        assert _events(dec, _input_frame(0x0146, 0x0C, age=17)) == [RAH]
+        clock.now += 1.755
+        assert _events(dec, _input_frame(0x0146, 0x0C, age=191)) == []
 
-        assert len(results) == 2
-        assert results[0].event == ButtonEventType.HOLD
-        assert results[1].event == ButtonEventType.RELEASE_AFTER_HOLD
+    def test_late_hold_copy_does_not_resurrect_hold(self, clock):
+        """Real case org=0x0104: second HOLD copy 0.7 s later (age 5 → 72)."""
+        dec = SwitchEventDecoder()
+        _events(dec, _button_frame(0x0638, _DOWN))
+        clock.now += 0.75
+        assert _events(dec, _input_frame(0x0104, 0x09, age=5)) == [H]
+        clock.now += 0.704
+        assert _events(dec, _input_frame(0x0104, 0x09, age=72)) == []
 
+    def test_same_origin_accepted_when_origin_time_differs(self, clock):
+        """Counter wrap-around: same origin, but originated much later → new event."""
+        dec = SwitchEventDecoder()
+        frame = _button_frame(0x15B0, _DOWN)
+        assert _events(dec, frame, _button_frame(0x15B1, _UP)) == [P, R]
+        clock.now += 60
+        assert _events(dec, frame) == [P]
 
-# ---------------------------------------------------------------------------
-# State reset tests
-# ---------------------------------------------------------------------------
+    def test_second_down_edge_reports_lost_release_first(self, clock):
+        """Both release frames lost: the next down edge proves the release."""
+        dec = SwitchEventDecoder()
+        got = _events(dec, _button_frame(0xAAA0, _DOWN), _button_frame(0xAAA2, _DOWN))
+        assert got == [P, R, P]
+
+    def test_second_down_edge_after_hold_reports_release_after_hold(self, clock):
+        dec = SwitchEventDecoder()
+        _events(dec, _button_frame(0xAAA0, _DOWN))
+        clock.now += 0.75
+        _events(dec, _input_frame(0x0001, 0x09))
+        clock.now += 2
+        assert _events(dec, _button_frame(0xAAA2, _DOWN)) == [RAH, P]
+
+    def test_late_release_of_previous_click_ignored(self, clock):
+        """Real case org=0x01FF: 0x02 of click 1 arrives after down of click 2.
+
+        Its origin time lies before the second press, so it must not release
+        the second press early.
+        """
+        dec = SwitchEventDecoder()
+        _events(dec, _button_frame(0x0634, _DOWN, age=9))
+        clock.now += 0.384
+        got = _events(dec, _button_frame(0x0636, _DOWN, age=8))
+        clock.now += 0.226
+        got += _events(dec, _input_frame(0x01FF, 0x02, age=36))
+        clock.now += 0.1
+        got += _events(dec, _button_frame(0x0637, _UP, age=7))
+        assert got == [R, P, R]
+
+    def test_streams_do_not_share_dedup_keys(self, clock):
+        """Unit 1: 0x06 origin 0x01xx can equal a 0x12 origin; both must count."""
+        dec = SwitchEventDecoder()
+        target_btn = (0x01 << 8) | _TARGET_TYPE_BUTTON
+        target_in = (0x01 << 8) | _TARGET_TYPE_INPUT
+        down = struct.pack(">HBHHH", 4, _OPCODE_BUTTON_0, 0x0119, target_btn, 1) + _DOWN
+        rel = (
+            struct.pack(">HBHHH", 2, _OPCODE_INPUT_0, 0x0119, target_in, 1)
+            + b"\x02\x08"
+        )
+        assert _events(dec, down, rel) == [P, R]
 
 
 class TestReset:
-    def test_reset_clears_dedup_state(self):
-        """After reset(), a frame with the same origin as a prior event is accepted."""
+    def test_reset_clears_dedup_and_phase(self, clock):
         dec = SwitchEventDecoder()
-        origin = 0x15B0
-        frame = _button_frame(origin=origin)
-
-        dec.decode(frame, packet_seq=1)  # accepted, origin recorded
+        frame = _button_frame(0x15B0, _DOWN)
+        _events(dec, frame)
         dec.reset()
-        results = dec.decode(frame, packet_seq=2)  # same origin, but state cleared
-
-        assert len(results) == 1
-        assert results[0].event == ButtonEventType.PRESS
-
-    def test_reset_called_on_reconnect_does_not_suppress_first_event(self):
-        """After reconnect (reset), the very first event is never suppressed."""
-        dec = SwitchEventDecoder()
+        assert _events(dec, frame) == [P]
         dec.reset()
-        frame = _button_frame(origin=0xDEAD)
-        results = dec.decode(frame, packet_seq=1)
-        assert len(results) == 1
+        assert _events(dec, _input_frame(0x0001, 0x02)) == []  # phase back to up
+
+
+# ---------------------------------------------------------------------------
+# Replay of a real capture (PTM215B, 2026-10-13)
+# ---------------------------------------------------------------------------
+
+_FIXTURE = Path(__file__).parent / "fixtures" / "ptm215b_2026-10-13.txt"
+
+# Ground truth per button, from the operator's action list and the frame
+# timing.  Where every frame of an edge was lost on air, the decoder cannot
+# know about it; those spots are noted and expected to stay silent.
+# fmt: off
+_EXPECTED = {
+    (6, 1): [
+        P, R, P, R, P, R,  # 3 single clicks
+        P, H, RAH,  # hold 5 s
+        P, R, P, R,  # double click (both 0x06 up frames lost)
+        P, R,  # double click, second click lost on air
+        P, H, RAH,  # hold 1.4 s
+        P, H, RAH,  # hold 1.7 s
+        P, R,  # single click
+    ],
+    (6, 3): [
+        P, R, P, R, P, R,  # 3 single clicks
+        P, H, RAH,  # hold 3.2 s
+        P, R,  # double click, second down frame lost
+        P, R, P, R,  # double click
+        P, H, RAH,  # hold 1.9 s
+        P, H, RAH,  # hold 4.4 s
+        P, H, RAH,  # hold 4.2 s
+    ],
+    (47, 1): [
+        P, R,  # single click
+        # single click, down frame lost: up + 0x02 alone stay silent
+        P, R,  # single click
+        P, H, RAH,  # hold 4.4 s
+        P, R, P, R,  # double click
+        P, R,  # double click, second click lost on air
+        P, H, RAH,  # hold, 0x06 up lost
+    ],
+    (47, 4): [P, R],  # single click
+}
+# fmt: on
+
+
+def _replay() -> dict[tuple[int, int], list[ButtonEventType]]:
+    clock = _Clock()
+    dec = SwitchEventDecoder()
+    got: dict[tuple[int, int], list[ButtonEventType]] = {}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(switch_module, "monotonic", clock)
+        for line in _FIXTURE.read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            ts, packet = line.split()
+            h, m, s = ts.split(":")
+            clock.now = int(h) * 3600 + int(m) * 60 + float(s)
+            for e in dec.decode(bytes.fromhex(packet)[1:], packet_seq=0):
+                got.setdefault((e.unit_id, e.button), []).append(e.event)
+    return got
+
+
+def test_replay_real_capture_matches_ground_truth():
+    assert _replay() == _EXPECTED
+
+
+def test_replay_has_valid_sequences_without_duplicates():
+    """Every action is press→release or press→hold→release_after_hold."""
+    for key, seq in _replay().items():
+        i = 0
+        while i < len(seq):
+            if seq[i : i + 2] == [P, R]:
+                i += 2
+            elif seq[i : i + 3] == [P, H, RAH]:
+                i += 3
+            else:
+                pytest.fail(f"{key}: invalid sequence at {i}: {seq[i : i + 3]}")
