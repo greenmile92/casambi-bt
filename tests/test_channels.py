@@ -14,7 +14,7 @@ from CasambiBt._network import (
     _withoutDisabledSensors,
     _withUnitCctRange,
 )
-from CasambiBt._unit import Unit, UnitControlType
+from CasambiBt._unit import Unit, UnitControlType, UnitState
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "fixtures_api"
 
@@ -129,3 +129,19 @@ def test_sensor_disabled_in_app_is_not_mapped():
 
     enabled = make_unit(5511, {"lux.disabled": 0.0})
     assert enabled.unitType.get_control(UnitControlType.LUX) is not None
+
+
+def test_temperature_roundtrip_is_stable():
+    """Kelvin read from a raw value must encode back to the same raw value.
+
+    Otherwise every save/restore through Home Assistant (scenes) moves the
+    white temperature one step down.
+    """
+    for lo, hi in ((2100, 3500), (2700, 6500)):
+        for raw in range(256):
+            kelvin = UnitState.temperature_from_int(raw, lo, hi, 8)
+            assert UnitState.int_from_temperature(kelvin, lo, hi, 8) == raw, (
+                lo,
+                hi,
+                raw,
+            )

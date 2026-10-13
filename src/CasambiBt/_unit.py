@@ -493,7 +493,9 @@ class UnitState:
         clampedTemp = min(max_temp, max(min_temp, temperature))
         assert length > 0, "Invalid temp length"
         tempMask: int = 2**length - 1
-        return (tempMask * (clampedTemp - min_temp)) // (max_temp - min_temp)
+        # Round, not floor: temperature_from_int floors, so flooring here too
+        # moved a value one step down on every read/write cycle.
+        return round(tempMask * (clampedTemp - min_temp) / (max_temp - min_temp))
 
     @staticmethod
     def temperature_from_int(
