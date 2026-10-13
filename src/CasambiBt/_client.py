@@ -16,6 +16,7 @@ from bleak_retry_connector import (
     BleakAbortedError,
     BleakNotFoundError,
     BleakOutOfConnectionSlotsError,
+    clear_cache,
     close_stale_connections,
     establish_connection,
     get_device,
@@ -374,7 +375,18 @@ class CasambiClientEvolution(CasambiClient):
             self._activityLock.release()
 
         # Wait for key exchange, will get notified by _exchNotifyCallback
-        await self._wait_timeout(self._notifySignal)
+        try:
+            await self._wait_timeout(self._notifySignal)
+        except BluetoothError:
+            # BlueZ keeps the notify session of a dropped connection (Notifying stays true)
+            # and re-enables it on the next connect, so StartNotify does not write the CCCD
+            # again and the unit never sends its key. Every further attempt hangs the same way.
+            # Removing the device from BlueZ clears it, like `bluetoothctl remove`.
+            cleared = await clear_cache(self.address)
+            self._logger.warning(
+                "No key exchange from %s, cleared BlueZ cache: %s", self.address, cleared
+            )
+            raise
         await self._activityLock.acquire()
         try:
             self._notifySignal.clear()

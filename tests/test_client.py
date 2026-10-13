@@ -341,3 +341,115 @@ async def test_exchange_key_fails_after_max_retries(client):
         await client.exchangeKey(retries=2)
 
     assert client._gattClient.read_gatt_char.call_count == 3
+
+
+def _key_exchange_packets() -> tuple[bytes, bytes]:
+    device_pub = ec.generate_private_key(ec.SECP256R1()).public_key().public_numbers()
+    pub_key = struct.pack(
+        "<B32s32s",
+        0x2,
+        device_pub.x.to_bytes(32, byteorder="little", signed=False),
+        device_pub.y.to_bytes(32, byteorder="little", signed=False),
+    )
+    return pub_key, struct.pack(">B", 0x3)
+
+
+class FakeBlueZ:
+    """BlueZ with a notify session left over from a dropped connection.
+
+    While the session is stale StartNotify does not write the CCCD, so the unit never sends its key.
+    Removing the device (clear_cache) drops the session.
+    """
+
+    def __init__(self, stale: bool) -> None:
+        self.stale = stale
+        self.cleared: list[str] = []
+
+    async def clear_cache(self, address: str) -> bool:
+        self.cleared.append(address)
+        self.stale = False
+        return True
+
+    def gatt_client(self, client: CasambiClientEvolution) -> AsyncMock:
+        gatt = AsyncMock()
+        gatt.read_gatt_char.return_value = struct.pack(
+            ">BBBHH16s", 0x1, 10, 23, 1, 0, b"1234567890123456"
+        )
+        pub_key, ack = _key_exchange_packets()
+
+        async def start_notify(*args, **kwargs):
+            if self.stale:
+                return
+
+            async def send():
+                await asyncio.sleep(0)
+                client._exchNotifyCallback(None, pub_key)
+                await asyncio.sleep(0.01)
+                client._exchNotifyCallback(None, ack)
+
+            asyncio.create_task(send())  # noqa: RUF006
+
+        gatt.start_notify.side_effect = start_notify
+        return gatt
+
+
+@pytest.fixture
+def short_timeout(monkeypatch):
+    orig = CasambiClientEvolution._wait_timeout
+
+    async def _wait(self, evt, timeout=15):
+        await orig(self, evt, 0.1)
+
+    monkeypatch.setattr(CasambiClientEvolution, "_wait_timeout", _wait)
+
+
+def _connected_client(mock_network, bluez: FakeBlueZ) -> CasambiClientEvolution:
+    # A fresh client per attempt, like Casambi._connectClient.
+    client = CasambiClientEvolution(
+        "00:11:22:33:44:55", MagicMock(), MagicMock(), mock_network
+    )
+    client._connectionState = ConnectionState.CONNECTED
+    client._gattClient = bluez.gatt_client(client)
+    return client
+
+
+async def test_key_exchange_hang_clears_bluez_and_next_attempt_succeeds(
+    mock_network, short_timeout
+):
+    bluez = FakeBlueZ(stale=True)
+    with patch("CasambiBt._client.clear_cache", bluez.clear_cache):
+        with pytest.raises(BluetoothError):
+            await _connected_client(mock_network, bluez).exchangeKey()
+        assert bluez.cleared == ["00:11:22:33:44:55"]
+
+        client = _connected_client(mock_network, bluez)
+        await client.exchangeKey()
+
+    assert client._connectionState == ConnectionState.AUTHENTICATED
+    assert bluez.cleared == ["00:11:22:33:44:55"]
+
+
+async def test_successful_key_exchange_does_not_clear_bluez(mock_network, short_timeout):
+    bluez = FakeBlueZ(stale=False)
+    with patch("CasambiBt._client.clear_cache", bluez.clear_cache):
+        client = _connected_client(mock_network, bluez)
+        await client.exchangeKey()
+
+    assert client._connectionState == ConnectionState.AUTHENTICATED
+    assert bluez.cleared == []
+
+
+async def test_normal_disconnect_does_not_clear_bluez(mock_network, disconnected_callback):
+    bluez = FakeBlueZ(stale=False)
+    client = CasambiClientEvolution(
+        "00:11:22:33:44:55", MagicMock(), disconnected_callback, mock_network
+    )
+    client._connectionState = ConnectionState.AUTHENTICATED
+    client._gattClient = AsyncMock()
+    client._gattClient.is_connected = True
+    with patch("CasambiBt._client.clear_cache", bluez.clear_cache):
+        client._on_disconnect(MagicMock())
+        await client.disconnect()
+
+    disconnected_callback.assert_called_once()
+    assert bluez.cleared == []
