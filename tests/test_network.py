@@ -1,6 +1,7 @@
 """Tests for the Network module."""
 
 import json
+import logging
 import pathlib
 import pickle
 from collections.abc import AsyncGenerator
@@ -12,10 +13,12 @@ import pytest
 
 from CasambiBt._cache import Cache
 from CasambiBt._network import (
+    LEGACY_TYPES_CACHE_FILE,
     SESSION_CACHE_FILE,
     TYPES_CACHE_FILE,
     Network,
     _NetworkSession,
+    _parseUnitType,
 )
 from CasambiBt.errors import (
     AuthenticationError,
@@ -481,3 +484,109 @@ async def test_update_classic_network(network: Network, mock_client: AsyncMock):
     assert network.protocolVersion == 5
     assert len(network.units) == 1
     assert network.units[0]._isClassic is True
+
+
+def _one_unit_network() -> dict:
+    return {
+        "status": "UPDATED",
+        "network": {
+            "revision": 2,
+            "name": "My Network",
+            "protocolVersion": 10,
+            "units": [
+                {
+                    "type": 10,
+                    "deviceID": 1,
+                    "uuid": "unit-uuid",
+                    "address": "00:11:22:33:44:55",
+                    "name": "My Unit",
+                    "firmware": "1.0",
+                }
+            ],
+            "grid": {"cells": []},
+            "scenes": [],
+        },
+    }
+
+
+def _slider_fixture() -> dict:
+    return {
+        "id": 10,
+        "model": "4CH",
+        "vendor": "Casambi",
+        "mode": "PWM/Elements",
+        "stateLength": 1,
+        "controls": [
+            {
+                "type": "slider",
+                "name": "CH1",
+                "offset": 0,
+                "length": 8,
+                "default": 0,
+                "readonly": False,
+            }
+        ],
+    }
+
+
+def _legacy_unit_types() -> dict:
+    """A types.pck written before UnitControl had a name: no 'name' in the pickle."""
+    unit_type = _parseUnitType(_slider_fixture(), logging.getLogger(__name__))
+    for control in unit_type.controls:
+        del control.__dict__["name"]
+    return {10: (unit_type, datetime.now(UTC) + timedelta(days=20))}
+
+
+async def _prepare_update(network: Network, mock_client: AsyncMock, cache: Cache):
+    network._session = _NetworkSession(
+        "sess", "net", True, 1, datetime.now(UTC) + timedelta(days=1)
+    )
+    network._id = "test-net"
+    data = _one_unit_network()
+    mock_client.put.return_value = httpx.Response(
+        200, json=data, content=json.dumps(data).encode()
+    )
+    async with cache as cache_path:
+        await (cache_path / LEGACY_TYPES_CACHE_FILE).write_bytes(
+            pickle.dumps(_legacy_unit_types())
+        )
+    await network._loadTypeCache()
+
+
+async def test_legacy_type_cache_used_when_fixture_api_unreachable(
+    network: Network, mock_client: AsyncMock, cache: Cache
+):
+    """First start after the cache rename while api.casambi.com is down: units stay."""
+    await _prepare_update(network, mock_client, cache)
+    mock_client.get.side_effect = httpx.ConnectError("offline")
+
+    await network.update()
+
+    assert [u.name for u in network.units] == ["My Unit"]
+    # Old pickle without the field still reads as "no name".
+    assert network.units[0].unitType.controls[0].name is None
+
+
+async def test_legacy_type_cache_refetched_when_online(
+    network: Network, mock_client: AsyncMock, cache: Cache
+):
+    """The old cache must not hide the channel names for its remaining lifetime."""
+    await _prepare_update(network, mock_client, cache)
+    mock_client.get.return_value = httpx.Response(200, json=_slider_fixture())
+
+    await network.update()
+
+    assert network.units[0].unitType.controls[0].name == "CH1"
+    mock_client.get.assert_awaited_once()
+
+
+async def test_expired_type_kept_when_fixture_api_fails(
+    network: Network, mock_client: AsyncMock, cache: Cache
+):
+    """An expired type is a better fallback than dropping the unit for 7 days."""
+    await _prepare_update(network, mock_client, cache)
+    mock_client.get.return_value = httpx.Response(503)
+
+    await network.update()
+
+    assert [u.name for u in network.units] == ["My Unit"]

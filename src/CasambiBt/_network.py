@@ -22,6 +22,7 @@ from .errors import (
 SESSION_CACHE_FILE: Final = "session.pck"
 # v2: UnitControl carries the channel name. Older caches lack it, so refetch once.
 TYPES_CACHE_FILE: Final = "types-v2.pck"
+LEGACY_TYPES_CACHE_FILE: Final = "types.pck"
 
 
 def _parseUnitType(unitTypeJson: dict, logger: logging.Logger) -> UnitType:
@@ -144,6 +145,16 @@ class Network:
                 typeData = await (cachePath / TYPES_CACHE_FILE).read_bytes()
                 self._unitTypes = pickle.loads(typeData)
                 self._logger.info("Unit type cache loaded.")
+            elif await (cachePath / LEGACY_TYPES_CACHE_FILE).exists():
+                # Types without channel names: refetch all, but keep them as a
+                # fallback in case the fixture API is unreachable.
+                typeData = await (cachePath / LEGACY_TYPES_CACHE_FILE).read_bytes()
+                expired = datetime.min.replace(tzinfo=UTC)
+                self._unitTypes = {
+                    id: (unitType, expired)
+                    for id, (unitType, _) in pickle.loads(typeData).items()
+                }
+                self._logger.info("Legacy unit type cache loaded, refetching types.")
 
     async def _saveTypeCache(self) -> None:
         self._logger.debug("Saving type cache...")
@@ -389,22 +400,34 @@ class Network:
         self._logger.info(f"Fetching unit type for id {id}...")
 
         # Check whether unit type is already cached
+        staleType: UnitType | None = None
         if id in self._unitTypes:
             cachedType, cacheExpiry = self._unitTypes[id]
 
             # We don't want to cache types forever so use an expiry date.
+            # The expired entry stays as fallback until the refetch succeeds.
             if cacheExpiry < datetime.now(UTC):
                 self._logger.info("Cache expiry for type %i. Refetching.", id)
-                self._unitTypes.pop(id)
+                staleType = cachedType
             else:
                 self._logger.info("Using cached type.")
                 return cachedType
 
         getUnitInfoUrl = f"https://api.casambi.com/fixture/{id}"
-        res = await self._httpClient.get(getUnitInfoUrl)
+        try:
+            res = await self._httpClient.get(getUnitInfoUrl)
+        except RequestError:
+            if staleType is None:
+                raise
+            self._logger.warning(
+                "Fetching type %i failed, using expired cache.", id, exc_info=True
+            )
+            return staleType
 
         if res.status_code != httpx.codes.OK:
             self._logger.error(f"Getting unit info returned {res.status_code}")
+            if staleType is not None:
+                return staleType
             self._unitTypes[id] = (
                 None,
                 datetime.now(UTC) + timedelta(days=7),
