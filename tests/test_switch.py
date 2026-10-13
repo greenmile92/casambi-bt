@@ -264,6 +264,23 @@ class TestDedup:
         got += _events(dec, _button_frame(0x0637, _UP))
         assert got == [P, R, P, H, RAH]
 
+    def test_repeated_down_telegram_inside_hold_is_not_a_new_press(self, clock):
+        """Real case Bad button 2: down 0x0986, HOLD, down 0x0987, 0x0C, up."""
+        dec = SwitchEventDecoder()
+        got = _events(dec, _button_frame(0x0986, _DOWN))
+        clock.now += 0.7
+        got += _events(dec, _input_frame(0x0170, 0x09))
+        clock.now += 0.6
+        got += _events(dec, _button_frame(0x0987, _DOWN))
+        clock.now += 3.4
+        got += _events(dec, _input_frame(0x0126, 0x0C), _button_frame(0x0988, _UP))
+        assert got == [P, H, RAH]
+
+    def test_counter_wraps_for_repeated_down(self, clock):
+        dec = SwitchEventDecoder()
+        got = _events(dec, _button_frame(0x09FF, _DOWN), _button_frame(0x0900, _DOWN))
+        assert got == [P]
+
 
 class TestReset:
     def test_reset_clears_dedup_and_phase(self, clock):
@@ -280,7 +297,7 @@ class TestReset:
 # Replay of a real capture (PTM215B, 2026-10-13)
 # ---------------------------------------------------------------------------
 
-_FIXTURE = Path(__file__).parent / "fixtures" / "ptm215b_2026-10-13.txt"
+_FIXTURES = Path(__file__).parent / "fixtures"
 
 # Ground truth per button, from the operator's action list and the frame
 # timing.  Where every frame of an edge was lost on air, the decoder cannot
@@ -316,16 +333,32 @@ _EXPECTED = {
     ],
     (47, 4): [P, R],  # single click
 }
+
+_EXPECTED_BAD = {
+    (9, 1): [
+        P, R,  # single click
+        P, H, RAH,  # hold 2.5 s
+        # double click, first down frame lost: its up + 0x02 stay silent
+        P, R,
+    ],
+    (9, 2): [
+        # hold 4.7 s with a second down telegram (counter +1, no up edge)
+        # 1.3 s in; the node reports one HOLD and one 0x0C
+        P, H, RAH,
+        P, R, P, R,  # double click
+        P, H, RAH,  # hold 3.9 s
+    ],
+}
 # fmt: on
 
 
-def _replay() -> dict[tuple[int, int], list[ButtonEventType]]:
+def _replay(name: str) -> dict[tuple[int, int], list[ButtonEventType]]:
     clock = _Clock()
     dec = SwitchEventDecoder()
     got: dict[tuple[int, int], list[ButtonEventType]] = {}
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(switch_module, "monotonic", clock)
-        for line in _FIXTURE.read_text().splitlines():
+        for line in (_FIXTURES / name).read_text().splitlines():
             if line.startswith("#"):
                 continue
             ts, packet = line.split()
@@ -336,13 +369,21 @@ def _replay() -> dict[tuple[int, int], list[ButtonEventType]]:
     return got
 
 
-def test_replay_real_capture_matches_ground_truth():
-    assert _replay() == _EXPECTED
+_CAPTURES = [
+    ("ptm215b_2026-10-13.txt", _EXPECTED),
+    ("ptm215b_bad_2026-10-13.txt", _EXPECTED_BAD),
+]
 
 
-def test_replay_has_valid_sequences_without_duplicates():
+@pytest.mark.parametrize(("name", "expected"), _CAPTURES)
+def test_replay_real_capture_matches_ground_truth(name, expected):
+    assert _replay(name) == expected
+
+
+@pytest.mark.parametrize(("name", "expected"), _CAPTURES)
+def test_replay_has_valid_sequences_without_duplicates(name, expected):
     """Every action is press→release or press→hold→release_after_hold."""
-    for key, seq in _replay().items():
+    for key, seq in _replay(name).items():
         i = 0
         while i < len(seq):
             if seq[i : i + 2] == [P, R]:

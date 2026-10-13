@@ -81,8 +81,9 @@ class SwitchEventDecoder:
     def __init__(self) -> None:
         # (unit_id, button_index, target_type, origin) -> estimated origin time
         self._seen_origins: dict[tuple[int, int, int, int], float] = {}
-        # (unit_id, button_index) -> (_UP / _DOWN / _HELD, origin time of press)
-        self._phase: dict[tuple[int, int], tuple[str, float]] = {}
+        # (unit_id, button_index) -> (_UP / _DOWN / _HELD, origin time and
+        # origin of the last down edge)
+        self._phase: dict[tuple[int, int], tuple[str, float, int]] = {}
         self._logger = _LOGGER
 
     def reset(self) -> None:
@@ -120,22 +121,29 @@ class SwitchEventDecoder:
         target_type: int,
         code: int,
         is_down: bool,
+        origin: int,
         origin_time: float,
     ) -> list[ButtonEventType]:
         """Map one accepted frame to events (usually zero or one)."""
-        phase, press_time = self._phase.get(key, (_UP, 0.0))
+        phase, press_time, press_origin = self._phase.get(key, (_UP, 0.0, -1))
 
         if target_type == _TARGET_TYPE_BUTTON and is_down:
             events = []
             if phase != _UP:
-                # A new down edge proves the previous release, whose frames
-                # were all lost (or are still in flight and will be stale).
+                if origin == (press_origin & 0xFF00) | ((press_origin + 1) & 0xFF):
+                    # Telegram counter +1: the switch sent no up edge in
+                    # between.  The node keeps classifying one action (single
+                    # HOLD/0x0C on 0x12), so this is not a new press.
+                    self._phase[key] = (phase, press_time, origin)
+                    return []
+                # A counter gap means the up edge was sent but lost; its
+                # 0x12 frames are lost too or will arrive stale.
                 events.append(
                     ButtonEventType.RELEASE_AFTER_HOLD
                     if phase == _HELD
                     else ButtonEventType.RELEASE
                 )
-            self._phase[key] = (_DOWN, origin_time)
+            self._phase[key] = (_DOWN, origin_time, origin)
             return events + [ButtonEventType.PRESS]
 
         if target_type == _TARGET_TYPE_INPUT and code not in _INPUT_CODES:
@@ -157,12 +165,12 @@ class SwitchEventDecoder:
         elif code == ButtonEventType.RELEASE_AFTER_HOLD.value:
             event = ButtonEventType.RELEASE_AFTER_HOLD
         elif code == ButtonEventType.HOLD.value and phase == _DOWN:
-            self._phase[key] = (_HELD, press_time)
+            self._phase[key] = (_HELD, press_time, press_origin)
             return [ButtonEventType.HOLD]
         else:
             return []  # 0x06 is the source for PRESS; others out of phase
 
-        self._phase[key] = (_UP, press_time)
+        self._phase[key] = (_UP, press_time, press_origin)
         return [event]
 
     def decode(self, data: bytes, packet_seq: int) -> list[SwitchEvent]:
@@ -221,7 +229,12 @@ class SwitchEventDecoder:
                 continue
 
             classified = self._classify(
-                (unit_id, button_event_index), target_type, code, is_down, origin_time
+                (unit_id, button_event_index),
+                target_type,
+                code,
+                is_down,
+                frame.origin,
+                origin_time,
             )
             if not classified:
                 self._logger.debug(
