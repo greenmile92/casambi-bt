@@ -250,6 +250,20 @@ class TestDedup:
         )
         assert _events(dec, down, rel) == [P, R]
 
+    def test_late_release_of_previous_click_does_not_cut_next_hold(self, clock):
+        """Late 0x02 of click 1 must not end click 2, which turns into a hold."""
+        dec = SwitchEventDecoder()
+        got = _events(dec, _button_frame(0x0634, _DOWN))
+        clock.now += 0.4
+        got += _events(dec, _button_frame(0x0636, _DOWN))
+        clock.now += 0.2
+        got += _events(dec, _input_frame(0x01FF, 0x02, age=40))
+        clock.now += 0.6
+        got += _events(dec, _input_frame(0x0104, 0x09))
+        clock.now += 1.0
+        got += _events(dec, _button_frame(0x0637, _UP))
+        assert got == [P, R, P, H, RAH]
+
 
 class TestReset:
     def test_reset_clears_dedup_and_phase(self, clock):
